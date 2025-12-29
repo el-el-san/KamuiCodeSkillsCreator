@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 """
 MCP Skill Generator
-Generates a Skill from .mcp.json and tools.info specifications.
+Generates a Skill from .mcp.json and mcp_tool_catalog.yaml specifications.
 """
 
 import argparse
 import json
 import os
 import re
+import sys
 from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+# Default catalog URL
+CATALOG_URL = "https://raw.githubusercontent.com/Yumeno/kamuicode-config-manager/main/mcp_tool_catalog.yaml"
 
 
 def load_mcp_config(path: str) -> dict:
@@ -60,6 +74,120 @@ def load_tools_info(path: str) -> list[dict]:
                 if line.strip():
                     tools.append(json.loads(line))
             return tools
+
+
+def fetch_catalog(catalog_url: str = CATALOG_URL) -> dict:
+    """Fetch mcp_tool_catalog.yaml from URL.
+
+    Returns:
+        dict with 'metadata' and 'servers' keys
+    """
+    if requests is None:
+        print("Error: 'requests' module required. Install with: pip install requests", file=sys.stderr)
+        sys.exit(1)
+    if yaml is None:
+        print("Error: 'pyyaml' module required. Install with: pip install pyyaml", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Fetching catalog from {catalog_url}...")
+    try:
+        resp = requests.get(catalog_url, timeout=30)
+        resp.raise_for_status()
+        catalog = yaml.safe_load(resp.text)
+        print(f"Catalog loaded: {catalog['metadata']['total_servers']} servers available")
+        return catalog
+    except requests.RequestException as e:
+        print(f"Error fetching catalog: {e}", file=sys.stderr)
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def find_server_in_catalog(catalog: dict, server_id: str) -> dict | None:
+    """Find server by ID in catalog.
+
+    First tries exact match, then partial match with user selection.
+
+    Returns:
+        Server dict with 'id', 'status', 'tools' etc., or None if not found
+    """
+    servers = catalog.get("servers", [])
+
+    # Try exact match first
+    for server in servers:
+        if server.get("id") == server_id:
+            print(f"Found exact match: {server_id}")
+            return server
+
+    # No exact match - try partial match
+    partial_matches = []
+    server_id_lower = server_id.lower()
+    for server in servers:
+        sid = server.get("id", "")
+        if server_id_lower in sid.lower():
+            partial_matches.append(server)
+
+    if not partial_matches:
+        print(f"No server found matching '{server_id}'", file=sys.stderr)
+        return None
+
+    if len(partial_matches) == 1:
+        chosen = partial_matches[0]
+        print(f"Found partial match: {chosen['id']}")
+        return chosen
+
+    # Multiple matches - ask user to choose
+    print(f"\nNo exact match for '{server_id}'. Found {len(partial_matches)} partial matches:\n")
+    for i, server in enumerate(partial_matches, 1):
+        status = server.get("status", "unknown")
+        tools_count = len(server.get("tools", []))
+        print(f"  {i}. {server['id']} [{status}] ({tools_count} tools)")
+
+    print(f"\n  0. Cancel")
+
+    while True:
+        try:
+            choice = input("\nSelect server number: ").strip()
+            if choice == "0":
+                print("Cancelled.")
+                return None
+            idx = int(choice) - 1
+            if 0 <= idx < len(partial_matches):
+                chosen = partial_matches[idx]
+                print(f"Selected: {chosen['id']}")
+                return chosen
+            print(f"Invalid choice. Enter 1-{len(partial_matches)} or 0 to cancel.")
+        except ValueError:
+            print("Please enter a number.")
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return None
+
+
+def load_tools_from_catalog(catalog: dict, server_id: str) -> list[dict]:
+    """Load tool definitions from catalog for a given server ID.
+
+    Args:
+        catalog: The full catalog dict
+        server_id: Server ID to look up
+
+    Returns:
+        List of tool definitions
+    """
+    server = find_server_in_catalog(catalog, server_id)
+    if not server:
+        return []
+
+    if server.get("status") == "error":
+        print(f"Warning: Server '{server_id}' has error status: {server.get('error_message', 'unknown')}", file=sys.stderr)
+
+    tools = server.get("tools", [])
+    if not tools:
+        print(f"Warning: Server '{server_id}' has no tools defined", file=sys.stderr)
+
+    print(f"Loaded {len(tools)} tools from catalog")
+    return tools
 
 
 def identify_async_pattern(tools: list[dict]) -> dict:
@@ -530,13 +658,36 @@ if __name__ == "__main__":
 
 def generate_skill(
     mcp_config_path: str,
-    tools_info_path: str,
     output_dir: str,
     skill_name: str | None = None,
+    tools_info_path: str | None = None,
+    catalog_url: str = CATALOG_URL,
 ):
-    """Generate complete skill from MCP config and tools info."""
+    """Generate complete skill from MCP config and catalog.
+
+    Args:
+        mcp_config_path: Path to .mcp.json
+        output_dir: Output directory for generated skill
+        skill_name: Skill name (auto-detected if not specified)
+        tools_info_path: Optional path to tools.info (legacy mode)
+        catalog_url: URL to mcp_tool_catalog.yaml
+    """
     mcp_config = load_mcp_config(mcp_config_path)
-    tools = load_tools_info(tools_info_path)
+
+    # Get server ID from mcp_config
+    server_id = mcp_config.get("name", "")
+
+    # Load tools - from catalog or legacy tools.info
+    if tools_info_path:
+        print(f"Using legacy tools.info: {tools_info_path}")
+        tools = load_tools_info(tools_info_path)
+    else:
+        # Fetch from catalog
+        catalog = fetch_catalog(catalog_url)
+        tools = load_tools_from_catalog(catalog, server_id)
+        if not tools:
+            print(f"Error: Could not load tools for server '{server_id}'", file=sys.stderr)
+            sys.exit(1)
 
     # Determine skill name
     if not skill_name:
@@ -570,25 +721,72 @@ def generate_skill(
     (references_dir / "mcp.json").write_text(json.dumps(mcp_config, indent=2, ensure_ascii=False), encoding='utf-8')
     (references_dir / "tools.json").write_text(json.dumps(tools, indent=2, ensure_ascii=False), encoding='utf-8')
 
-    print(f"Skill generated: {skill_dir}")
-    print(f"  - SKILL.md")
-    print(f"  - scripts/mcp_async_call.py")
-    print(f"  - scripts/{skill_name.replace('-', '_')}.py")
-    print(f"  - references/mcp.json")
-    print(f"  - references/tools.json")
+    print(f"\n✓ Skill generated: {skill_dir}")
+    print(f"  {skill_dir}/")
+    print(f"  ├── SKILL.md")
+    print(f"  ├── scripts/")
+    print(f"  │   ├── mcp_async_call.py")
+    print(f"  │   └── {skill_name.replace('-', '_')}.py")
+    print(f"  └── references/")
+    print(f"      ├── mcp.json")
+    print(f"      └── tools.json")
 
     return str(skill_dir)
 
 
+def get_default_output_dir() -> str:
+    """Get default output directory (.claude/skills relative to cwd or script location)."""
+    # Try current working directory first
+    cwd_skills = Path.cwd() / ".claude" / "skills"
+    if cwd_skills.parent.exists():  # .claude exists
+        return str(cwd_skills)
+
+    # Fall back to script location
+    script_skills = Path(__file__).parent.parent.parent
+    if script_skills.name == "skills" and script_skills.parent.name == ".claude":
+        return str(script_skills)
+
+    # Default to cwd/.claude/skills
+    return str(cwd_skills)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate MCP Skill from config files")
+    default_output = get_default_output_dir()
+    parser = argparse.ArgumentParser(
+        description="Generate MCP Skill from config files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate skill using catalog (recommended)
+  # Output: .claude/skills/<skill-name>/SKILL.md
+  python generate_skill.py -m mcp.json
+
+  # Generate skill with legacy tools.info
+  python generate_skill.py -m mcp.json -t tools.info
+
+  # Use custom catalog URL
+  python generate_skill.py -m mcp.json --catalog-url https://example.com/catalog.yaml
+
+  # Specify custom output directory
+  python generate_skill.py -m mcp.json -o ./custom/path
+"""
+    )
     parser.add_argument("--mcp-config", "-m", required=True, help="Path to .mcp.json")
-    parser.add_argument("--tools-info", "-t", required=True, help="Path to tools.info")
-    parser.add_argument("--output", "-o", default=".", help="Output directory")
+    parser.add_argument("--tools-info", "-t", help="Path to tools.info (legacy mode, optional)")
+    parser.add_argument("--output", "-o", default=default_output,
+                        help=f"Output directory (default: {default_output})")
     parser.add_argument("--name", "-n", help="Skill name (auto-detected if not specified)")
+    parser.add_argument("--catalog-url", default=CATALOG_URL,
+                        help=f"URL to mcp_tool_catalog.yaml (default: {CATALOG_URL})")
 
     args = parser.parse_args()
-    generate_skill(args.mcp_config, args.tools_info, args.output, args.name)
+    generate_skill(
+        mcp_config_path=args.mcp_config,
+        output_dir=args.output,
+        skill_name=args.name,
+        tools_info_path=args.tools_info,
+        catalog_url=args.catalog_url,
+    )
 
 
 if __name__ == "__main__":

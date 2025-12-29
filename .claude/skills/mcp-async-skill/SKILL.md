@@ -1,6 +1,6 @@
 ---
 name: mcp-async-skill
-description: Generate Skills from HTTP MCP servers with async job patterns (submit/status/result). Use when converting MCP specifications (.mcp.json + tools.info) into reusable Skills, or when calling async MCP tools via JSON-RPC 2.0 with session-based polling.
+description: Generate Skills from HTTP MCP servers with async job patterns (submit/status/result). Use when converting MCP specifications (.mcp.json) into reusable Skills using mcp_tool_catalog.yaml, or when calling async MCP tools via JSON-RPC 2.0 with session-based polling.
 ---
 
 # MCP Async Skill Generator
@@ -9,7 +9,7 @@ Generate reusable Skills from HTTP MCP servers that use async job patterns.
 
 ## When to Use
 
-- Converting `.mcp.json` + `tools.info` into a packaged Skill
+- Converting `.mcp.json` into a packaged Skill (tool info is fetched from catalog)
 - Calling async MCP tools: submit → poll status → get result → download
 - Integrating image/video generation MCPs (fal.ai, Replicate, etc.)
 
@@ -38,14 +38,36 @@ The returned URL (e.g., `https://v3b.fal.media/files/...`) can be used in `image
 
 ## Quick Start
 
-### Generate Skill from MCP Config
+### Generate Skill from MCP Config (Recommended)
+
+Tool information is automatically fetched from `mcp_tool_catalog.yaml`:
+
+```bash
+python scripts/generate_skill.py \
+  --mcp-config /path/to/.mcp.json
+```
+
+Output: `.claude/skills/<skill-name>/SKILL.md`
+
+The server name in `.mcp.json` is used to look up tools from the catalog.
+
+### Generate Skill with Legacy tools.info
+
+If you have a local `tools.info` file:
 
 ```bash
 python scripts/generate_skill.py \
   --mcp-config /path/to/.mcp.json \
   --tools-info /path/to/tools.info \
-  --output /home/claude/output \
   --name my-mcp-skill
+```
+
+### Specify Custom Output Directory
+
+```bash
+python scripts/generate_skill.py \
+  --mcp-config /path/to/.mcp.json \
+  --output /custom/path
 ```
 
 ### Direct Async Tool Call
@@ -89,15 +111,60 @@ All MCP calls use this structure:
 
 ### .mcp.json
 
+The server `name` must match a server `id` in the catalog:
+
 ```json
 {
-  "name": "my-mcp-server",
-  "url": "https://mcp.example.com/sse",
-  "type": "url"
+  "mcpServers": {
+    "t2i-kamui-fal-flux-lora": {
+      "type": "http",
+      "url": "https://kamui-code.ai/t2i/fal/flux-lora",
+      "headers": {
+        "KAMUI-CODE-PASS": "your-pass"
+      }
+    }
+  }
 }
 ```
 
-### tools.info
+Or direct format:
+
+```json
+{
+  "name": "t2i-kamui-fal-flux-lora",
+  "url": "https://kamui-code.ai/t2i/fal/flux-lora",
+  "auth_header": "KAMUI-CODE-PASS",
+  "auth_value": "your-pass"
+}
+```
+
+### mcp_tool_catalog.yaml (Auto-fetched)
+
+Tool information is fetched from:
+`https://raw.githubusercontent.com/Yumeno/kamuicode-config-manager/main/mcp_tool_catalog.yaml`
+
+The catalog contains 266+ servers with tool definitions:
+
+```yaml
+servers:
+  - id: t2i-kamui-fal-flux-lora
+    status: online
+    tools:
+      - name: flux_lora_submit
+        description: Submit Flux LoRA image generation request
+        inputSchema:
+          properties:
+            prompt:
+              description: Image prompt
+              type: string
+          required:
+            - prompt
+          type: object
+```
+
+### tools.info (Legacy)
+
+Optional, for backward compatibility:
 
 ```json
 [
@@ -139,22 +206,29 @@ Main async MCP caller with full flow automation.
 Generate complete Skill from MCP specifications.
 
 **Options:**
-- `--mcp-config, -m`: Path to .mcp.json
-- `--tools-info, -t`: Path to tools.info
+- `--mcp-config, -m`: Path to .mcp.json (required)
+- `--tools-info, -t`: Path to tools.info (optional, legacy mode)
 - `--output, -o`: Output directory
 - `--name, -n`: Skill name (auto-detected if omitted)
+- `--catalog-url`: Custom catalog URL (default: GitHub raw URL)
+
+**Requirements:**
+- `pip install pyyaml requests` (for catalog fetching)
 
 ## Generated Skill Structure
 
+Skills are generated to `.claude/skills/<skill-name>/`:
+
 ```
-skill-name/
-├── SKILL.md              # Usage documentation
-├── scripts/
-│   ├── mcp_async_call.py # Core async caller
-│   └── skill_name.py     # Convenience wrapper
-└── references/
-    ├── mcp.json          # Original MCP config
-    └── tools.json        # Original tool specs
+.claude/skills/
+└── skill-name/
+    ├── SKILL.md              # Usage documentation
+    ├── scripts/
+    │   ├── mcp_async_call.py # Core async caller
+    │   └── skill_name.py     # Convenience wrapper
+    └── references/
+        ├── mcp.json          # Original MCP config
+        └── tools.json        # Original tool specs
 ```
 
 ## Common Status Values
