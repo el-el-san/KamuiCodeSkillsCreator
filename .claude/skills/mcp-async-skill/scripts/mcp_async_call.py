@@ -2,11 +2,15 @@
 """
 MCP Async Tool Caller
 Handles submit → status polling → result pattern for async MCP tools.
+
+IMPORTANT: Requires mcp_queue_daemon to be running.
+All jobs are submitted through the queue daemon for rate limiting and concurrency control.
 """
 
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import uuid
@@ -28,6 +32,81 @@ except Exception:
     pass  # reconfigure failed, continue with default encoding
 
 import requests
+
+# Import queue protocol for daemon communication
+try:
+    from mcp_queue_protocol import (
+        MessageType,
+        sync_send_message,
+        sync_recv_message,
+        make_submit_job_payload,
+    )
+    QUEUE_PROTOCOL_AVAILABLE = True
+except ImportError:
+    QUEUE_PROTOCOL_AVAILABLE = False
+
+# YAML support
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+# Default daemon socket path
+DEFAULT_RUNTIME_DIR = Path.home() / ".cache" / "mcp-queue"
+DEFAULT_SOCKET_NAME = "mcp-queue.sock"
+
+# Default queue config
+DEFAULT_QUEUE_CONFIG = {
+    "poll_interval": 30.0,
+    "job_timeout": 900,
+}
+
+
+def load_queue_config() -> dict:
+    """
+    Load queue configuration from queue_config.yaml.
+
+    Search order:
+    1. Script directory
+    2. Skill root (parent of script directory)
+    3. Current directory
+
+    Returns:
+        dict with poll_interval, job_timeout, etc.
+    """
+    config = DEFAULT_QUEUE_CONFIG.copy()
+    config_names = ["queue_config.yaml", "queue_config.yml", "queue_config.json"]
+
+    search_paths = [
+        Path(__file__).parent,           # Script directory
+        Path(__file__).parent.parent,    # Skill root
+        Path.cwd(),                       # Current directory
+    ]
+
+    for search_dir in search_paths:
+        for name in config_names:
+            config_path = search_dir / name
+            if config_path.exists():
+                try:
+                    with open(config_path, encoding="utf-8") as f:
+                        if config_path.suffix in (".yaml", ".yml"):
+                            if YAML_AVAILABLE:
+                                file_config = yaml.safe_load(f)
+                            else:
+                                continue  # Skip YAML if not available
+                        else:
+                            file_config = json.load(f)
+
+                    if file_config:
+                        for k, v in file_config.items():
+                            if not k.startswith("//"):
+                                config[k] = v
+                    return config
+                except Exception:
+                    pass  # Try next file
+
+    return config
 
 # Content-Type to extension mapping
 CONTENT_TYPE_MAP = {
@@ -190,16 +269,33 @@ def extract_download_urls(result: dict) -> list[str]:
 
     Traverses the entire response structure to find all URL strings,
     regardless of key names. Handles nested dicts, lists, and JSON strings.
+
+    Filters out API/status endpoint URLs that should not be downloaded.
     """
     urls = []
     seen = set()  # Avoid duplicates
+
+    # URL patterns to exclude (API endpoints, not actual files)
+    excluded_patterns = [
+        "queue.fal.run",  # fal.ai status endpoints
+        "/requests/",     # request status URLs
+        "/status",        # status check endpoints
+    ]
+
+    def _is_downloadable_url(url: str) -> bool:
+        """Check if URL is an actual downloadable file, not an API endpoint."""
+        for pattern in excluded_patterns:
+            if pattern in url:
+                return False
+        return True
 
     def _extract(obj):
         if isinstance(obj, str):
             # Check if it's a URL
             if obj.startswith(("http://", "https://")) and obj not in seen:
-                seen.add(obj)
-                urls.append(obj)
+                if _is_downloadable_url(obj):
+                    seen.add(obj)
+                    urls.append(obj)
             # Check if it's a JSON string that might contain URLs
             elif obj.startswith("{") or obj.startswith("["):
                 try:
@@ -460,6 +556,8 @@ def run_async_mcp_job(
     auto_filename: bool = False,
     poll_interval: float = 2.0,
     max_polls: int = 300,
+    poll_retry_max: int = 3,
+    poll_retry_backoff: float = 2.0,
     headers: dict | None = None,
     completed_statuses: list[str] | None = None,
     failed_statuses: list[str] | None = None,
@@ -481,6 +579,8 @@ def run_async_mcp_job(
         auto_filename: If True, use {request_id}_{timestamp}.{ext} format
         poll_interval: Seconds between status polls
         max_polls: Maximum number of poll attempts
+        poll_retry_max: Maximum retries per poll on transient errors
+        poll_retry_backoff: Backoff multiplier for retry wait time
         headers: Additional HTTP headers (auth, etc.)
         completed_statuses: List of status strings indicating completion
         failed_statuses: List of status strings indicating failure
@@ -521,16 +621,74 @@ def run_async_mcp_job(
     }
     print(f"[SUBMIT] Request ID: {request_id}")
 
-    # Step 2: Poll status
+    # Step 2: Poll status with retry on transient errors
     print(f"[STATUS] Polling {status_tool}...")
     status = "pending"
     poll_count = 0
     status_result = {}
+    total_retry_count = 0
+    consecutive_errors = 0
+
+    # Transient HTTP errors that should be retried
+    RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+    # Safety limits
+    MAX_TOTAL_RETRIES = poll_retry_max * max_polls  # Absolute upper bound
+    MAX_CONSECUTIVE_ERRORS = poll_retry_max * 3     # Give up if too many consecutive errors
 
     while poll_count < max_polls:
         poll_count += 1
-        status_resp = client.check_status(status_tool, request_id, id_param_name)
-        status, status_result = parse_status_response(status_resp)
+        retry_count = 0
+        poll_succeeded = False
+
+        while retry_count < poll_retry_max:
+            try:
+                status_resp = client.check_status(status_tool, request_id, id_param_name)
+                status, status_result = parse_status_response(status_resp)
+                poll_succeeded = True
+                consecutive_errors = 0  # Reset on success
+                break  # Success, exit retry loop
+
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if e.response is not None else 0
+                retry_count += 1
+                total_retry_count += 1
+                consecutive_errors += 1
+
+                # Check safety limits
+                if total_retry_count >= MAX_TOTAL_RETRIES:
+                    raise RuntimeError(f"Max total retries ({MAX_TOTAL_RETRIES}) exceeded") from e
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    raise RuntimeError(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) exceeded") from e
+
+                if status_code in RETRYABLE_STATUS_CODES and retry_count < poll_retry_max:
+                    wait_time = min(poll_interval * (poll_retry_backoff ** retry_count), 60.0)  # Cap at 60s
+                    print(f"[STATUS] Poll {poll_count} HTTP {status_code}, retry {retry_count}/{poll_retry_max} in {wait_time:.1f}s")
+                    time.sleep(wait_time)
+                    continue
+                raise  # Non-retryable or max retries exceeded
+
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                retry_count += 1
+                total_retry_count += 1
+                consecutive_errors += 1
+
+                # Check safety limits
+                if total_retry_count >= MAX_TOTAL_RETRIES:
+                    raise RuntimeError(f"Max total retries ({MAX_TOTAL_RETRIES}) exceeded") from e
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    raise RuntimeError(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) exceeded") from e
+
+                if retry_count < poll_retry_max:
+                    wait_time = min(poll_interval * (poll_retry_backoff ** retry_count), 60.0)  # Cap at 60s
+                    print(f"[STATUS] Poll {poll_count} network error, retry {retry_count}/{poll_retry_max} in {wait_time:.1f}s: {type(e).__name__}")
+                    time.sleep(wait_time)
+                    continue
+                raise  # Max retries exceeded
+
+        if not poll_succeeded:
+            raise RuntimeError(f"Poll {poll_count} failed after {retry_count} retries")
+
         print(f"[STATUS] Poll {poll_count}: {status}")
 
         if status in completed_statuses:
@@ -543,10 +701,14 @@ def run_async_mcp_job(
     else:
         raise TimeoutError(f"Job did not complete within {max_polls} polls")
 
+    if total_retry_count > 0:
+        print(f"[STATUS] Total retries during polling: {total_retry_count}")
+
     logs["status_final"] = {
         "timestamp": timestamp_now(),
         "tool": status_tool,
         "poll_count": poll_count,
+        "total_retries": total_retry_count,
         "status": status,
         "response": status_result,
     }
@@ -638,11 +800,149 @@ def load_mcp_config(config_path: str) -> dict:
         return json.load(f)
 
 
+def connect_to_daemon(socket_path: Path | None = None) -> socket.socket:
+    """
+    Connect to the queue daemon via Unix socket.
+
+    Args:
+        socket_path: Path to the daemon socket (default: ~/.cache/mcp-queue/mcp-queue.sock)
+
+    Returns:
+        Connected socket
+
+    Raises:
+        RuntimeError: If daemon is not running or connection fails
+    """
+    if socket_path is None:
+        socket_path = DEFAULT_RUNTIME_DIR / DEFAULT_SOCKET_NAME
+
+    if not socket_path.exists():
+        raise RuntimeError(
+            f"Queue daemon not running (socket not found: {socket_path})\n"
+            f"Start the daemon with: python mcp_queue_daemon.py --background"
+        )
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(str(socket_path))
+        return sock
+    except ConnectionRefusedError:
+        raise RuntimeError(
+            f"Queue daemon not accepting connections (socket: {socket_path})\n"
+            f"The daemon may have crashed. Restart with: python mcp_queue_daemon.py --background"
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to connect to queue daemon: {e}")
+
+
+def submit_job_to_daemon(
+    sock: socket.socket,
+    endpoint: str,
+    submit_tool: str,
+    submit_args: dict,
+    status_tool: str,
+    result_tool: str,
+    headers: dict | None = None,
+    id_param_name: str = "request_id",
+    poll_interval: float = 2.0,
+    max_polls: int = 300,
+    output_dir: str | None = None,
+    output_file: str | None = None,
+    auto_filename: bool = False,
+    save_logs_to_dir: bool = False,
+    save_logs_inline: bool = False,
+) -> dict:
+    """
+    Submit a job to the queue daemon and wait for completion.
+
+    Returns:
+        Job result dict
+    """
+    if not QUEUE_PROTOCOL_AVAILABLE:
+        raise RuntimeError("Queue protocol module not available")
+
+    job_id = str(uuid.uuid4())
+
+    # Create job payload
+    payload = make_submit_job_payload(
+        job_id=job_id,
+        endpoint=endpoint,
+        submit_tool=submit_tool,
+        submit_args=submit_args,
+        status_tool=status_tool,
+        result_tool=result_tool,
+        headers=headers,
+        id_param_name=id_param_name,
+        poll_interval=poll_interval,
+        max_polls=max_polls,
+        output_dir=output_dir,
+        output_file=output_file,
+        auto_filename=auto_filename,
+        save_logs_to_dir=save_logs_to_dir,
+        save_logs_inline=save_logs_inline,
+    )
+
+    # Submit job
+    print(f"[QUEUE] Submitting job {job_id[:8]}... to daemon")
+    sync_send_message(sock, MessageType.SUBMIT_JOB, payload)
+
+    # Wait for job_accepted
+    response = sync_recv_message(sock)
+    if not response:
+        raise RuntimeError("Connection closed by daemon")
+
+    if response.get("type") == MessageType.ERROR:
+        raise RuntimeError(f"Daemon error: {response.get('error', 'Unknown error')}")
+
+    if response.get("type") == MessageType.JOB_ACCEPTED:
+        print(f"[QUEUE] Job accepted, waiting for completion...")
+    else:
+        print(f"[QUEUE] Received: {response.get('type')}")
+
+    # Wait for job_completed or job_failed
+    while True:
+        response = sync_recv_message(sock)
+        if not response:
+            raise RuntimeError("Connection closed by daemon while waiting for job completion")
+
+        msg_type = response.get("type")
+
+        if msg_type == MessageType.JOB_COMPLETED:
+            print(f"[QUEUE] Job completed successfully")
+            return response.get("result", {})
+
+        elif msg_type == MessageType.JOB_FAILED:
+            error = response.get("error", "Unknown error")
+            raise RuntimeError(f"Job failed: {error}")
+
+        elif msg_type == MessageType.ERROR:
+            raise RuntimeError(f"Daemon error: {response.get('error', 'Unknown error')}")
+
+        else:
+            # Unknown message type, log and continue waiting
+            print(f"[QUEUE] Received message: {msg_type}")
+
+
 def main():
+    # Load queue config first for default values
+    queue_config = load_queue_config()
+    default_poll_interval = queue_config.get("poll_interval", 30.0)
+    default_job_timeout = queue_config.get("job_timeout", 900)
+    default_max_polls = int(default_job_timeout / default_poll_interval)
+
     parser = argparse.ArgumentParser(
-        description="Run async MCP job",
+        description="Run async MCP job (requires queue daemon)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+IMPORTANT: This tool requires the queue daemon to be running.
+Start the daemon first:
+  python mcp_queue_daemon.py --background
+
+Config loaded from queue_config.yaml:
+  poll_interval: {default_poll_interval}s
+  job_timeout: {default_job_timeout}s
+  max_polls: {default_max_polls}
+
 Examples:
   # Basic usage (directory output, auto filename)
   python mcp_async_call.py --endpoint "..." --submit-tool "..." --output ./results/
@@ -670,60 +970,88 @@ Examples:
     parser.add_argument("--output", "-o", default="./output", help="Output directory (default: ./output)")
     parser.add_argument("--output-file", "-O", help="Output file path (overrides auto filename)")
     parser.add_argument("--auto-filename", action="store_true", help="Use {request_id}_{timestamp}.{ext} format")
-    parser.add_argument("--poll-interval", type=float, default=2.0, help="Poll interval in seconds")
-    parser.add_argument("--max-polls", type=int, default=300, help="Maximum poll attempts")
+    parser.add_argument("--poll-interval", type=float, default=default_poll_interval,
+                        help=f"Poll interval in seconds (default: {default_poll_interval} from config)")
+    parser.add_argument("--max-polls", type=int, default=default_max_polls,
+                        help=f"Maximum poll attempts (default: {default_max_polls} from config)")
     parser.add_argument("--header", action="append", help="Add header (format: Key:Value)")
     parser.add_argument("--id-param", default="request_id", help="Job ID parameter name (request_id or session_id)")
     parser.add_argument("--save-logs", action="store_true", help="Save logs to {output}/logs/")
     parser.add_argument("--save-logs-inline", action="store_true", help="Save logs alongside output file")
+    parser.add_argument("--socket", help="Queue daemon socket path (default: ~/.cache/mcp-queue/mcp-queue.sock)")
 
     args = parser.parse_args()
 
-    # Load config
-    endpoint = args.endpoint
-    if args.config:
-        config = load_mcp_config(args.config)
-        endpoint = endpoint or config.get("url") or config.get("endpoint")
-
-    if not endpoint:
-        print("Error: Endpoint URL required (--endpoint or in --config)", file=sys.stderr)
+    # Check if queue protocol is available
+    if not QUEUE_PROTOCOL_AVAILABLE:
+        print("Error: Queue protocol module not found (mcp_queue_protocol.py)", file=sys.stderr)
+        print("Make sure mcp_queue_protocol.py is in the same directory", file=sys.stderr)
         sys.exit(1)
 
-    # Parse headers
-    headers = {"Content-Type": "application/json"}
-    if args.header:
-        for h in args.header:
-            key, val = h.split(":", 1)
-            headers[key.strip()] = val.strip()
+    # Connect to daemon (required)
+    socket_path = Path(args.socket) if args.socket else None
+    try:
+        sock = connect_to_daemon(socket_path)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    # Parse submit arguments
-    submit_args = {}
-    if args.args:
-        submit_args = json.loads(args.args)
-    elif args.args_file:
-        with open(args.args_file, encoding='utf-8') as f:
-            submit_args = json.load(f)
+    try:
+        # Load config
+        endpoint = args.endpoint
+        if args.config:
+            config = load_mcp_config(args.config)
+            endpoint = endpoint or config.get("url") or config.get("endpoint")
 
-    # Run
-    result = run_async_mcp_job(
-        endpoint=endpoint,
-        submit_tool=args.submit_tool,
-        submit_args=submit_args,
-        status_tool=args.status_tool,
-        result_tool=args.result_tool,
-        output_dir=args.output,
-        output_file=args.output_file,
-        auto_filename=args.auto_filename,
-        poll_interval=args.poll_interval,
-        max_polls=args.max_polls,
-        headers=headers,
-        id_param_name=args.id_param,
-        save_logs_to_dir=args.save_logs,
-        save_logs_inline=args.save_logs_inline,
-    )
+        if not endpoint:
+            print("Error: Endpoint URL required (--endpoint or in --config)", file=sys.stderr)
+            sys.exit(1)
 
-    print("\n=== Result ===")
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+        # Parse headers
+        headers = {"Content-Type": "application/json"}
+        if args.header:
+            for h in args.header:
+                key, val = h.split(":", 1)
+                headers[key.strip()] = val.strip()
+
+        # Parse submit arguments
+        submit_args = {}
+        if args.args:
+            submit_args = json.loads(args.args)
+        elif args.args_file:
+            with open(args.args_file, encoding='utf-8') as f:
+                submit_args = json.load(f)
+
+        # Submit job to daemon and wait for result
+        result = submit_job_to_daemon(
+            sock=sock,
+            endpoint=endpoint,
+            submit_tool=args.submit_tool,
+            submit_args=submit_args,
+            status_tool=args.status_tool,
+            result_tool=args.result_tool,
+            headers=headers,
+            id_param_name=args.id_param,
+            poll_interval=args.poll_interval,
+            max_polls=args.max_polls,
+            output_dir=args.output,
+            output_file=args.output_file,
+            auto_filename=args.auto_filename,
+            save_logs_to_dir=args.save_logs,
+            save_logs_inline=args.save_logs_inline,
+        )
+
+        print("\n=== Result ===")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user", file=sys.stderr)
+        sys.exit(130)
+    finally:
+        sock.close()
 
 
 if __name__ == "__main__":

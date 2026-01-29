@@ -343,8 +343,8 @@ def convert_tools_to_yaml_dict(tools: list[dict], mcp_config: dict = None, skill
                 "--output, -o": "出力ディレクトリ (デフォルト: ./output)",
                 "--output-file, -O": "出力ファイルパス (上書き許可)",
                 "--auto-filename": "{request_id}_{timestamp}.{ext} 形式で命名",
-                "--poll-interval": "ポーリング間隔秒数 (デフォルト: 2.0)",
-                "--max-polls": "最大ポーリング回数 (デフォルト: 300)",
+                "--poll-interval": "ポーリング間隔秒数 (デフォルト: queue_config.yaml の poll_interval)",
+                "--max-polls": "最大ポーリング回数 (デフォルト: job_timeout / poll_interval)",
                 "--header": "カスタムヘッダー追加 (Key:Value形式、複数可)",
                 "--id-param": "ジョブIDパラメータ名 (デフォルト: request_id)",
                 "--save-logs": "{output}/logs/ にログ保存",
@@ -702,8 +702,8 @@ python .claude/skills/{skill_name}/scripts/mcp_async_call.py \\
 | `--output` | `-o` | 出力ディレクトリ | `./output` |
 | `--output-file` | `-O` | 出力ファイルパス (上書き許可) | 自動生成 |
 | `--auto-filename` | - | `{{request_id}}_{{timestamp}}.{{ext}}` 形式で命名 | 無効 |
-| `--poll-interval` | - | ポーリング間隔 (秒) | `2.0` |
-| `--max-polls` | - | 最大ポーリング回数 | `300` |
+| `--poll-interval` | - | ポーリング間隔 (秒) | `queue_config.yaml` の `poll_interval` |
+| `--max-polls` | - | 最大ポーリング回数 | `job_timeout / poll_interval` |
 | `--header` | - | カスタムヘッダー追加 (`Key:Value`形式、複数可) | - |
 | `--id-param` | - | ジョブIDパラメータ名 | `request_id` |
 | `--save-logs` | - | `{{output}}/logs/` にログ保存 | 無効 |
@@ -845,41 +845,150 @@ def detect_id_param_name(tools: list[dict]) -> str:
     return "request_id"  # Default to request_id
 
 
-def generate_wrapper_script(mcp_config: dict, tools: list[dict], skill_name: str) -> str:
-    """Generate convenience wrapper script that delegates to mcp_async_call.py."""
+def _convert_env_var_to_python(value: str) -> str:
+    """Convert ${ENV_VAR} pattern to os.environ.get() call.
+
+    Args:
+        value: String that may contain ${ENV_VAR} pattern
+
+    Returns:
+        Python expression string (either quoted literal or os.environ.get call)
+    """
+    import re
+    # Match ${VAR_NAME} pattern
+    match = re.match(r'^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$', value)
+    if match:
+        env_var_name = match.group(1)
+        return f'os.environ.get("{env_var_name}", "")'
+    return f'"{value}"'
+
+
+def load_queue_config(config_path: Path | None = None) -> dict:
+    """Load queue_config.yaml and return defaults.
+
+    Searches for config in order:
+    1. Provided config_path
+    2. Parent skill directory (queue_config.yaml)
+    3. Base mcp-async-skill directory
+
+    Returns:
+        dict with poll_interval and max_polls
+    """
+    defaults = {"poll_interval": 2.0, "max_polls": 300}
+
+    # Search paths for config
+    search_paths = []
+    if config_path:
+        search_paths.append(config_path)
+
+    # Add default locations
+    script_dir = Path(__file__).parent
+    search_paths.extend([
+        script_dir.parent / "queue_config.yaml",  # Current skill
+        script_dir.parent.parent / "mcp-async-skill" / "queue_config.yaml",  # Base skill
+    ])
+
+    config = None
+    for path in search_paths:
+        if path.exists():
+            try:
+                with open(path, encoding='utf-8') as f:
+                    if path.suffix == ".yaml" or path.suffix == ".yml":
+                        if yaml is None:
+                            print(f"Warning: pyyaml not installed, cannot read {path}", file=sys.stderr)
+                            continue
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+                break
+            except Exception:
+                continue
+
+    if config:
+        poll_interval = config.get("poll_interval", defaults["poll_interval"])
+        job_timeout = config.get("job_timeout", 600)
+
+        # Calculate max_polls from job_timeout / poll_interval
+        max_polls = int(job_timeout / poll_interval) if poll_interval > 0 else defaults["max_polls"]
+
+        return {"poll_interval": poll_interval, "max_polls": max_polls}
+
+    return defaults
+
+
+def generate_wrapper_script(mcp_config: dict, tools: list[dict], skill_name: str, queue_config: dict | None = None) -> str:
+    """Generate convenience wrapper script that uses queue manager with fallback to direct call.
+
+    Args:
+        mcp_config: MCP configuration dict
+        tools: List of tool definitions
+        skill_name: Name of the skill
+        queue_config: Optional queue config dict with poll_interval and max_polls defaults
+    """
     endpoint = mcp_config.get("url") or mcp_config.get("endpoint", "")
     pattern = identify_async_pattern(tools)
     id_param_name = detect_id_param_name(tools)
 
-    # Get auth headers for --header arguments
+    # Get polling defaults from queue_config or use fallback
+    poll_defaults = queue_config or {"poll_interval": 2.0, "max_polls": 300}
+    default_poll_interval = poll_defaults.get("poll_interval", 2.0)
+    default_max_polls = poll_defaults.get("max_polls", 300)
+
+    # Get auth headers
     all_headers = mcp_config.get("all_headers", {})
     auth_header = mcp_config.get("auth_header", "")
     auth_value = mcp_config.get("auth_value", "")
 
+    # Build headers dict for Python code (with env var expansion)
+    headers_dict_lines = []
+    if all_headers:
+        for k, v in all_headers.items():
+            python_value = _convert_env_var_to_python(v)
+            headers_dict_lines.append(f'    "{k}": {python_value},')
+    elif auth_header and auth_value:
+        python_value = _convert_env_var_to_python(auth_value)
+        headers_dict_lines.append(f'    "{auth_header}": {python_value},')
+
+    headers_dict_str = "\n".join(headers_dict_lines) if headers_dict_lines else ""
+
+    # Build header defaults for CLI fallback (with env var expansion using f-string)
     header_defaults = []
     if all_headers:
         for k, v in all_headers.items():
-            header_defaults.append(f'    ("--header", "{k}:{v}"),')
+            if re.match(r'^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$', v):
+                env_var = re.match(r'^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$', v).group(1)
+                header_defaults.append(f'    ("--header", f"{k}:{{os.environ.get(\'{env_var}\', \'\')}}"),')
+            else:
+                header_defaults.append(f'    ("--header", "{k}:{v}"),')
     elif auth_header and auth_value:
-        header_defaults.append(f'    ("--header", "{auth_header}:{auth_value}"),')
+        if re.match(r'^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$', auth_value):
+            env_var = re.match(r'^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$', auth_value).group(1)
+            header_defaults.append(f'    ("--header", f"{auth_header}:{{os.environ.get(\'{env_var}\', \'\')}}"),')
+        else:
+            header_defaults.append(f'    ("--header", "{auth_header}:{auth_value}"),')
 
     header_defaults_str = "\n".join(header_defaults) if header_defaults else ""
 
     script = f'''#!/usr/bin/env python3
 """
-{skill_name} - Wrapper with preset defaults for mcp_async_call.py
+{skill_name} - Wrapper with queue manager support and fallback to direct call.
 
 This wrapper pre-configures endpoint, tool names, and authentication.
-All mcp_async_call.py options are supported and can override defaults.
+Uses mcp_queue_client for rate-limited, queued execution when available.
+Falls back to direct mcp_async_call.py if queue manager is unavailable.
 
 Usage:
     python {skill_name.replace('-', '_')}.py --args '{{"prompt": "..."}}'
     python {skill_name.replace('-', '_')}.py --args '{{"prompt": "..."}}' --auto-filename --save-logs
+    python {skill_name.replace('-', '_')}.py --no-queue --args '...'  # Force direct call
     python {skill_name.replace('-', '_')}.py --help  # Show all available options
 """
 
+import argparse
+import json
 import sys
 import os
+from pathlib import Path
 
 # Force UTF-8 encoding for stdout/stderr (prevents UnicodeEncodeError on Windows)
 try:
@@ -890,34 +999,114 @@ try:
 except Exception:
     pass
 
-# Preset defaults (injected if not specified by user)
-DEFAULTS = [
-    ("--endpoint", "{endpoint}"),
-    ("--submit-tool", "{pattern['submit'][0] if pattern['submit'] else 'submit'}"),
-    ("--status-tool", "{pattern['status'][0] if pattern['status'] else 'status'}"),
-    ("--result-tool", "{pattern['result'][0] if pattern['result'] else 'result'}"),
-    ("--id-param", "{id_param_name}"),
+# Preset configuration
+ENDPOINT = "{endpoint}"
+SUBMIT_TOOL = "{pattern['submit'][0] if pattern['submit'] else 'submit'}"
+STATUS_TOOL = "{pattern['status'][0] if pattern['status'] else 'status'}"
+RESULT_TOOL = "{pattern['result'][0] if pattern['result'] else 'result'}"
+ID_PARAM_NAME = "{id_param_name}"
+HEADERS = {{
+    "Content-Type": "application/json",
+{headers_dict_str}
+}}
+
+# CLI fallback defaults
+CLI_DEFAULTS = [
+    ("--endpoint", ENDPOINT),
+    ("--submit-tool", SUBMIT_TOOL),
+    ("--status-tool", STATUS_TOOL),
+    ("--result-tool", RESULT_TOOL),
+    ("--id-param", ID_PARAM_NAME),
 {header_defaults_str}
 ]
 
-def main():
-    # Inject defaults into sys.argv (only if not already specified)
-    args = sys.argv[1:]
-    for key, value in DEFAULTS:
-        # For --header, always add (can have multiple)
+
+def run_with_queue(args: argparse.Namespace) -> dict:
+    """Run job via queue manager."""
+    sys.path.insert(0, os.path.dirname(__file__))
+    from mcp_queue_client import submit_and_wait
+
+    # Find config file
+    skill_dir = Path(__file__).parent.parent
+    config_path = skill_dir / "queue_config.yaml"
+    if not config_path.exists():
+        config_path = None
+
+    submit_args = {{}}
+    if args.args:
+        submit_args = json.loads(args.args)
+    elif args.args_file:
+        with open(args.args_file, encoding='utf-8') as f:
+            submit_args = json.load(f)
+
+    return submit_and_wait(
+        endpoint=ENDPOINT,
+        submit_tool=SUBMIT_TOOL,
+        submit_args=submit_args,
+        status_tool=STATUS_TOOL,
+        result_tool=RESULT_TOOL,
+        output_dir=args.output,
+        output_file=args.output_file,
+        auto_filename=args.auto_filename,
+        poll_interval=args.poll_interval,
+        max_polls=args.max_polls,
+        headers=HEADERS,
+        id_param_name=ID_PARAM_NAME,
+        save_logs_to_dir=args.save_logs,
+        save_logs_inline=args.save_logs_inline,
+        config_path=config_path,
+    )
+
+
+def run_direct(args: list[str]) -> None:
+    """Run directly via mcp_async_call.py (fallback)."""
+    # Inject defaults
+    for key, value in CLI_DEFAULTS:
         if key == "--header":
             if key not in args:
                 args = [key, value] + args
-        # For other options, only add if not specified
         elif key not in args:
             args = [key, value] + args
 
     sys.argv = [sys.argv[0]] + args
-
-    # Import and run mcp_async_call.py main
     sys.path.insert(0, os.path.dirname(__file__))
     from mcp_async_call import main as mcp_main
     mcp_main()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="{skill_name} wrapper",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--args", "-a", help="Submit arguments (JSON string)")
+    parser.add_argument("--args-file", help="Submit arguments from JSON file")
+    parser.add_argument("--output", "-o", default="./output", help="Output directory")
+    parser.add_argument("--output-file", "-O", help="Output file path")
+    parser.add_argument("--auto-filename", action="store_true", help="Use auto filename")
+    parser.add_argument("--poll-interval", type=float, default={default_poll_interval}, help="Poll interval (seconds)")
+    parser.add_argument("--max-polls", type=int, default={default_max_polls}, help="Max poll attempts")
+    parser.add_argument("--save-logs", action="store_true", help="Save logs to logs/")
+    parser.add_argument("--save-logs-inline", action="store_true", help="Save logs alongside output")
+    parser.add_argument("--no-queue", action="store_true", help="Skip queue manager, call directly")
+
+    args, unknown = parser.parse_known_args()
+
+    # Try queue manager first (unless --no-queue)
+    if not args.no_queue:
+        try:
+            result = run_with_queue(args)
+            print("\\n=== Result ===")
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return
+        except ImportError:
+            print("[INFO] Queue client not available, using direct call", file=sys.stderr)
+        except Exception as e:
+            print(f"[INFO] Queue manager error: {{e}}, using direct call", file=sys.stderr)
+
+    # Fallback to direct call (remove wrapper-only args)
+    direct_args = [a for a in sys.argv[1:] if a != "--no-queue"]
+    run_direct(direct_args)
 
 
 if __name__ == "__main__":
@@ -983,8 +1172,24 @@ def generate_skill(
     if async_script.exists():
         (scripts_dir / "mcp_async_call.py").write_text(async_script.read_text(encoding='utf-8'), encoding='utf-8')
 
-    # Generate wrapper script
-    wrapper = generate_wrapper_script(mcp_config, tools, skill_name)
+    # Copy queue manager files (client and protocol only, daemon is global)
+    queue_client = Path(__file__).parent / "mcp_queue_client.py"
+    queue_protocol = Path(__file__).parent / "mcp_queue_protocol.py"
+    if queue_client.exists():
+        (scripts_dir / "mcp_queue_client.py").write_text(queue_client.read_text(encoding='utf-8'), encoding='utf-8')
+    if queue_protocol.exists():
+        (scripts_dir / "mcp_queue_protocol.py").write_text(queue_protocol.read_text(encoding='utf-8'), encoding='utf-8')
+
+    # Copy default queue config (YAML format)
+    queue_config_template = Path(__file__).parent.parent / "queue_config.yaml"
+    if queue_config_template.exists():
+        (skill_dir / "queue_config.yaml").write_text(queue_config_template.read_text(encoding='utf-8'), encoding='utf-8')
+
+    # Load queue config for wrapper defaults
+    queue_config = load_queue_config(queue_config_template)
+
+    # Generate wrapper script with queue config defaults
+    wrapper = generate_wrapper_script(mcp_config, tools, skill_name, queue_config)
     wrapper_path = scripts_dir / f"{skill_name.replace('-', '_')}.py"
     wrapper_path.write_text(wrapper, encoding='utf-8')
     os.chmod(wrapper_path, 0o755)
@@ -1013,8 +1218,11 @@ def generate_skill(
         print(f"\n✓ Skill generated (lazy mode): {skill_dir}")
         print(f"  {skill_dir}/")
         print(f"  ├── SKILL.md")
+        print(f"  ├── queue_config.yaml")
         print(f"  ├── scripts/")
         print(f"  │   ├── mcp_async_call.py")
+        print(f"  │   ├── mcp_queue_client.py")
+        print(f"  │   ├── mcp_queue_protocol.py")
         print(f"  │   └── {skill_name.replace('-', '_')}.py")
         print(f"  └── references/")
         print(f"      ├── mcp.json")
@@ -1027,8 +1235,11 @@ def generate_skill(
         print(f"\n✓ Skill generated: {skill_dir}")
         print(f"  {skill_dir}/")
         print(f"  ├── SKILL.md")
+        print(f"  ├── queue_config.yaml")
         print(f"  ├── scripts/")
         print(f"  │   ├── mcp_async_call.py")
+        print(f"  │   ├── mcp_queue_client.py")
+        print(f"  │   ├── mcp_queue_protocol.py")
         print(f"  │   └── {skill_name.replace('-', '_')}.py")
         print(f"  └── references/")
         print(f"      ├── mcp.json")
@@ -1156,8 +1367,24 @@ def generate_skill_internal(
     if async_script.exists():
         (scripts_dir / "mcp_async_call.py").write_text(async_script.read_text(encoding='utf-8'), encoding='utf-8')
 
-    # Generate wrapper script
-    wrapper = generate_wrapper_script(mcp_config, tools, skill_name)
+    # Copy queue manager files (client and protocol only, daemon is global)
+    queue_client = Path(__file__).parent / "mcp_queue_client.py"
+    queue_protocol = Path(__file__).parent / "mcp_queue_protocol.py"
+    if queue_client.exists():
+        (scripts_dir / "mcp_queue_client.py").write_text(queue_client.read_text(encoding='utf-8'), encoding='utf-8')
+    if queue_protocol.exists():
+        (scripts_dir / "mcp_queue_protocol.py").write_text(queue_protocol.read_text(encoding='utf-8'), encoding='utf-8')
+
+    # Copy default queue config (YAML format)
+    queue_config_template = Path(__file__).parent.parent / "queue_config.yaml"
+    if queue_config_template.exists():
+        (skill_dir / "queue_config.yaml").write_text(queue_config_template.read_text(encoding='utf-8'), encoding='utf-8')
+
+    # Load queue config for wrapper defaults
+    queue_config = load_queue_config(queue_config_template)
+
+    # Generate wrapper script with queue config defaults
+    wrapper = generate_wrapper_script(mcp_config, tools, skill_name, queue_config)
     wrapper_path = scripts_dir / f"{skill_name.replace('-', '_')}.py"
     wrapper_path.write_text(wrapper, encoding='utf-8')
     os.chmod(wrapper_path, 0o755)
@@ -1186,8 +1413,11 @@ def generate_skill_internal(
         print(f"\n✓ Skill generated (lazy mode): {skill_dir}")
         print(f"  {skill_dir}/")
         print(f"  ├── SKILL.md")
+        print(f"  ├── queue_config.yaml")
         print(f"  ├── scripts/")
         print(f"  │   ├── mcp_async_call.py")
+        print(f"  │   ├── mcp_queue_client.py")
+        print(f"  │   ├── mcp_queue_protocol.py")
         print(f"  │   └── {skill_name.replace('-', '_')}.py")
         print(f"  └── references/")
         print(f"      ├── mcp.json")
@@ -1200,8 +1430,11 @@ def generate_skill_internal(
         print(f"\n✓ Skill generated: {skill_dir}")
         print(f"  {skill_dir}/")
         print(f"  ├── SKILL.md")
+        print(f"  ├── queue_config.yaml")
         print(f"  ├── scripts/")
         print(f"  │   ├── mcp_async_call.py")
+        print(f"  │   ├── mcp_queue_client.py")
+        print(f"  │   ├── mcp_queue_protocol.py")
         print(f"  │   └── {skill_name.replace('-', '_')}.py")
         print(f"  └── references/")
         print(f"      ├── mcp.json")

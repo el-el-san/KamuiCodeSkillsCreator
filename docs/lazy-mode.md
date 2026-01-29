@@ -167,8 +167,8 @@ _usage:
     --output, -o: 出力ディレクトリ (デフォルト: ./output)
     --output-file, -O: 出力ファイルパス (上書き許可)
     --auto-filename: '{request_id}_{timestamp}.{ext} 形式で命名'
-    --poll-interval: ポーリング間隔秒数 (デフォルト: 2.0)
-    --max-polls: 最大ポーリング回数 (デフォルト: 300)
+    --poll-interval: ポーリング間隔秒数 (デフォルト: queue_config.yaml の poll_interval)
+    --max-polls: 最大ポーリング回数 (デフォルト: job_timeout / poll_interval)
     --header: カスタムヘッダー追加 (Key:Value形式、複数可)
     --id-param: ジョブIDパラメータ名 (デフォルト: request_id)
     --save-logs: '{output}/logs/ にログ保存'

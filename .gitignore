@@ -1,13 +1,47 @@
-# Claude Code local settings
-.claude/settings.local.json
-
-# Old directory
-old/
-
-# Output directory
-output/
-
-# MCP and tools files
-mcp*.json
-tools*
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime files
+*.pid
+*.sock
+*.wal
+*.log
+
+# Cache
+.cache/
+*.cache
+
+# Secrets (never commit)
+.env
+.env.*
+*.key
+credentials.json
+secrets.json
+mcp.json
+
+.codex
+AGENTS.md
+CLAUDE.md

@@ -1,0 +1,27 @@
+# MCP Queue Manager Configuration
+# ポーリングと同時実行数の設定
+
+# 同時実行数の上限
+max_concurrent: 2
+
+# ジョブ開始間隔 (秒) - 連続起動を防ぐ
+start_interval: 1.0
+
+# ポーリング間隔 (秒) - ステータス確認の間隔
+poll_interval: 30.0
+
+# ジョブタイムアウト (秒) - max_polls = job_timeout / poll_interval で計算
+job_timeout: 900
+
+# クライアント無通信タイムアウト (秒) - 0で無効
+client_idle_timeout: 0
+
+# グローバルレート制限
+global_rate_per_min: 10
+global_burst: 5
+
+# エンドポイント別レート制限 (オプション)
+# endpoint_rates:
+#   "https://api.example.com/mcp":
+#     rate_per_min: 5
+#     burst: 3
