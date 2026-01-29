@@ -21,12 +21,22 @@ try:
 except ImportError:
     requests = None
 
+# Force UTF-8 encoding for stdout/stderr (prevents UnicodeEncodeError on Windows)
+# Python 3.7+ required. errors='backslashreplace' ensures no crash on unencodable chars.
+try:
+    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
+    if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
+except Exception:
+    pass  # reconfigure failed, continue with default encoding
+
 # Default catalog URL
 CATALOG_URL = "https://raw.githubusercontent.com/Yumeno/kamuicode-config-manager/main/mcp_tool_catalog.yaml"
 
 
 def load_mcp_config(path: str) -> dict:
-    """Load .mcp.json configuration.
+    """Load .mcp.json configuration (single server, legacy).
 
     Supports formats:
     1. Direct: {"name": "...", "url": "...", ...}
@@ -55,6 +65,41 @@ def load_mcp_config(path: str) -> dict:
             return result
 
     return data
+
+
+def load_all_mcp_servers(path: str) -> dict[str, dict]:
+    """Load all MCP server configurations from .mcp.json.
+
+    Returns:
+        Dict mapping server_name -> server_config
+    """
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+
+    result = {}
+
+    # Handle mcpServers wrapper format
+    if "mcpServers" in data:
+        servers = data["mcpServers"]
+        if isinstance(servers, dict):
+            for server_name, server_config in servers.items():
+                # Flatten to expected format
+                config = {"name": server_name, **server_config}
+                # Convert headers dict to auth_header/auth_value
+                if "headers" in config:
+                    headers = config.pop("headers")
+                    if isinstance(headers, dict) and headers:
+                        first_key = next(iter(headers))
+                        config["auth_header"] = first_key
+                        config["auth_value"] = headers[first_key]
+                        config["all_headers"] = headers
+                result[server_name] = config
+    else:
+        # Direct format - single server
+        name = data.get("name", "mcp-server")
+        result[name] = data
+
+    return result
 
 
 def load_tools_info(path: str) -> list[dict]:
@@ -240,6 +285,107 @@ def detect_media_type(tools: list[dict]) -> str | None:
     return None
 
 
+def convert_tools_to_yaml_dict(tools: list[dict], mcp_config: dict = None, skill_name: str = None) -> dict:
+    """Convert tools list to a compact YAML-friendly dict structure with usage examples.
+
+    Args:
+        tools: List of tool definitions
+        mcp_config: MCP configuration dict (optional, for generating usage examples)
+        skill_name: Skill name (optional, for generating usage examples)
+
+    Returns:
+        Dict with _usage section and tool names as keys
+    """
+    result = {}
+
+    # Add usage section if mcp_config is provided
+    if mcp_config:
+        endpoint = mcp_config.get("url") or mcp_config.get("endpoint", "")
+        pattern = identify_async_pattern(tools)
+        example_args = get_required_params_example(tools)
+
+        # Build header args for bash
+        all_headers = mcp_config.get("all_headers", {})
+        auth_header = mcp_config.get("auth_header", "")
+        auth_value = mcp_config.get("auth_value", "")
+
+        header_lines = []
+        if all_headers:
+            for k, v in all_headers.items():
+                header_lines.append(f'  --header "{k}:{v}"')
+        elif auth_header and auth_value:
+            header_lines.append(f'  --header "{auth_header}:{auth_value}"')
+
+        header_arg = " \\\n".join(header_lines) if header_lines else ""
+        if header_arg:
+            header_arg = " \\\n" + header_arg
+
+        bash_example = f"""python .claude/skills/{skill_name}/scripts/mcp_async_call.py \\
+  --endpoint "{endpoint}" \\
+  --submit-tool "{pattern['submit'][0] if pattern['submit'] else 'SUBMIT_TOOL'}" \\
+  --status-tool "{pattern['status'][0] if pattern['status'] else 'STATUS_TOOL'}" \\
+  --result-tool "{pattern['result'][0] if pattern['result'] else 'RESULT_TOOL'}" \\
+  --args '{example_args}'{header_arg} \\
+  --output ./output"""
+
+        result["_usage"] = {
+            "description": "How to execute this MCP server's tools (run from project root)",
+            "bash": bash_example,
+            "wrapper": f"python .claude/skills/{skill_name}/scripts/{skill_name.replace('-', '_')}.py --args '{example_args}'" if skill_name else None,
+            "options": {
+                "--endpoint, -e": "MCPサーバーのエンドポイントURL",
+                "--config, -c": ".mcp.jsonからエンドポイントを読み込み",
+                "--submit-tool": "ジョブ送信用ツール名 (必須)",
+                "--status-tool": "ステータス確認用ツール名 (必須)",
+                "--result-tool": "結果取得用ツール名 (必須)",
+                "--args, -a": "送信引数 (JSON文字列)",
+                "--args-file": "送信引数をJSONファイルから読み込み",
+                "--output, -o": "出力ディレクトリ (デフォルト: ./output)",
+                "--output-file, -O": "出力ファイルパス (上書き許可)",
+                "--auto-filename": "{request_id}_{timestamp}.{ext} 形式で命名",
+                "--poll-interval": "ポーリング間隔秒数 (デフォルト: 2.0)",
+                "--max-polls": "最大ポーリング回数 (デフォルト: 300)",
+                "--header": "カスタムヘッダー追加 (Key:Value形式、複数可)",
+                "--id-param": "ジョブIDパラメータ名 (デフォルト: request_id)",
+                "--save-logs": "{output}/logs/ にログ保存",
+                "--save-logs-inline": "出力ファイル横にログ保存",
+            },
+            "notes": {
+                "execution": "必ずプロジェクトルートから実行すること",
+                "output_path": "--output の相対パスはカレントディレクトリ基準",
+                "multi_file": "複数URLがある場合は全て自動ダウンロード (連番サフィックス付与)",
+                "extension": "拡張子は --output-file > Content-Type > URL の優先順位で決定",
+            },
+        }
+
+    # Add tool definitions
+    for tool in tools:
+        name = tool.get("name", "")
+        schema = tool.get("inputSchema", tool.get("parameters", {}))
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+
+        # Build compact parameter structure (passthrough all schema fields)
+        params = {}
+        for pname, pspec in properties.items():
+            params[pname] = {
+                "type": pspec.get("type", "any"),
+                "description": pspec.get("description", ""),
+            }
+            # Passthrough additional schema fields (enum, default, minimum, maximum, items, etc.)
+            for key, value in pspec.items():
+                if key not in ("type", "description"):
+                    params[pname][key] = value
+
+        result[name] = {
+            "description": tool.get("description", ""),
+            "required": required,
+            "parameters": params,
+        }
+
+    return result
+
+
 def get_required_params_example(tools: list[dict]) -> str:
     """Get example JSON with required parameters from submit tool."""
     for tool in tools:
@@ -271,8 +417,15 @@ def get_required_params_example(tools: list[dict]) -> str:
     return '{"prompt": "your input here"}'
 
 
-def generate_skill_md(mcp_config: dict, tools: list[dict], skill_name: str) -> str:
-    """Generate SKILL.md content."""
+def generate_skill_md(mcp_config: dict, tools: list[dict], skill_name: str, lazy: bool = False) -> str:
+    """Generate SKILL.md content.
+
+    Args:
+        mcp_config: MCP configuration dict
+        tools: List of tool definitions
+        skill_name: Name of the skill
+        lazy: If True, generate minimal SKILL.md with tool references only
+    """
     endpoint = mcp_config.get("url") or mcp_config.get("endpoint", "")
     server_name = mcp_config.get("name", skill_name)
     auth_header = mcp_config.get("auth_header", "")
@@ -281,23 +434,69 @@ def generate_skill_md(mcp_config: dict, tools: list[dict], skill_name: str) -> s
     pattern = identify_async_pattern(tools)
 
     # Build tool documentation
-    tool_docs = []
-    for tool in tools:
-        name = tool.get("name", "")
-        desc = tool.get("description", "")
-        schema = tool.get("inputSchema", tool.get("parameters", {}))
-        properties = schema.get("properties", {})
+    if lazy:
+        # Lazy mode: minimal tool list (name + description only)
+        tool_list = []
+        for tool in tools:
+            name = tool.get("name", "")
+            desc = tool.get("description", "")
+            tool_list.append(f"- **{name}**: {desc}")
 
-        params_doc = []
-        for pname, pspec in properties.items():
-            ptype = pspec.get("type", "any")
-            pdesc = pspec.get("description", "")
-            required = pname in schema.get("required", [])
-            req_mark = "*" if required else ""
-            params_doc.append(f"  - `{pname}`{req_mark} ({ptype}): {pdesc}")
+        yaml_file = f"references/tools/{skill_name}.yaml"
+        tool_docs_section = f"""## Available Tools
 
-        tool_doc = f"### {name}\n{desc}\n\n**Parameters:**\n" + "\n".join(params_doc) if params_doc else f"### {name}\n{desc}"
-        tool_docs.append(tool_doc)
+> **Note:** Detailed tool definitions are NOT included in this document to save context window.
+> Before executing any tool, you MUST read the full specification from `{yaml_file}`.
+
+**Quick reference** (name and description only):
+
+{chr(10).join(tool_list)}
+
+### How to Use Tools
+
+1. **Read tool specification**: Use Read tool on `{yaml_file}`
+2. **Find the tool** you need and check its `required` parameters
+3. **Execute** using `scripts/mcp_async_call.py` with appropriate arguments
+"""
+    else:
+        # Full mode: existing behavior with detailed parameters
+        tool_docs = []
+        for tool in tools:
+            name = tool.get("name", "")
+            desc = tool.get("description", "")
+            schema = tool.get("inputSchema", tool.get("parameters", {}))
+            properties = schema.get("properties", {})
+
+            params_doc = []
+            for pname, pspec in properties.items():
+                ptype = pspec.get("type", "any")
+                pdesc = pspec.get("description", "")
+                required = pname in schema.get("required", [])
+                req_mark = "*" if required else ""
+
+                # Build additional schema info
+                extras = []
+                if "default" in pspec:
+                    extras.append(f"default: {pspec['default']}")
+                if "enum" in pspec:
+                    extras.append(f"options: {pspec['enum']}")
+                if "minimum" in pspec:
+                    extras.append(f"min: {pspec['minimum']}")
+                if "maximum" in pspec:
+                    extras.append(f"max: {pspec['maximum']}")
+                if "items" in pspec and isinstance(pspec["items"], dict) and "enum" in pspec["items"]:
+                    extras.append(f"options: {pspec['items']['enum']}")
+
+                extra_str = f" [{', '.join(extras)}]" if extras else ""
+                params_doc.append(f"  - `{pname}`{req_mark} ({ptype}): {pdesc}{extra_str}")
+
+            tool_doc = f"### {name}\n{desc}\n\n**Parameters:**\n" + "\n".join(params_doc) if params_doc else f"### {name}\n{desc}"
+            tool_docs.append(tool_doc)
+
+        tool_docs_section = f"""## Available Tools
+
+{chr(10).join(tool_docs)}
+"""
 
     # Authentication section
     all_headers = mcp_config.get("all_headers", {})
@@ -418,7 +617,47 @@ The returned URL can be used in the `{cfg['param']}` parameter.
     # Get example args based on required parameters
     example_args = get_required_params_example(tools)
 
-    skill_md = f"""---
+    # Generate different content based on lazy mode
+    if lazy:
+        # Lazy mode: minimal SKILL.md - defer details to YAML
+        yaml_ref = f"references/tools/{skill_name}.yaml"
+        skill_md = f"""---
+name: {skill_name}
+description: MCP skill for {server_name}. Provides async job execution with submit/status/result pattern via JSON-RPC 2.0. Use when calling {server_name} tools that require async processing.
+---
+
+# {skill_name}
+
+MCP integration for **{server_name}**.
+
+## Endpoint
+
+```
+{endpoint}
+```
+{auth_section}{async_section}{upload_section}
+{tool_docs_section}
+## How to Execute
+
+> Before executing any tool, **read the full specification** from `{yaml_ref}`.
+> The YAML file contains `_usage` section with execution examples and CLI options.
+
+```bash
+# Read tool specification first
+cat {yaml_ref}
+
+# Then execute (example from _usage.bash in YAML)
+python .claude/skills/{skill_name}/scripts/mcp_async_call.py --help
+```
+
+## References
+
+- Tool Specs & Usage: `{yaml_ref}`
+- MCP Config: `references/mcp.json`
+"""
+    else:
+        # Full mode: detailed SKILL.md with all information
+        skill_md = f"""---
 name: {skill_name}
 description: MCP skill for {server_name}. Provides async job execution with submit/status/result pattern via JSON-RPC 2.0. Use when calling {server_name} tools that require async processing.
 ---
@@ -435,10 +674,12 @@ MCP integration for **{server_name}**.
 {auth_section}
 ## Quick Start
 
-> **Note:** All paths below are relative to the skill base directory shown above.
+> **⚠️ 実行ディレクトリについて**
+> このスキルは**プロジェクトルートから**実行してください。
+> ユーザーが相対パス（例: `./output`）で保存先を指定した場合、プロジェクトルート基準で解釈してください。
 
 ```bash
-python scripts/mcp_async_call.py \\
+python .claude/skills/{skill_name}/scripts/mcp_async_call.py \\
   --endpoint "{endpoint}" \\
   --submit-tool "{pattern['submit'][0] if pattern['submit'] else 'SUBMIT_TOOL'}" \\
   --status-tool "{pattern['status'][0] if pattern['status'] else 'STATUS_TOOL'}" \\
@@ -446,11 +687,49 @@ python scripts/mcp_async_call.py \\
   --args '{example_args}' \\{header_arg}
   --output ./output
 ```
+
+## CLI Options
+
+| オプション | 短縮 | 説明 | デフォルト |
+|-----------|------|------|-----------|
+| `--endpoint` | `-e` | MCPサーバーのエンドポイントURL | - |
+| `--config` | `-c` | .mcp.jsonからエンドポイントを読み込み | - |
+| `--submit-tool` | - | ジョブ送信用ツール名 (必須) | - |
+| `--status-tool` | - | ステータス確認用ツール名 (必須) | - |
+| `--result-tool` | - | 結果取得用ツール名 (必須) | - |
+| `--args` | `-a` | 送信引数 (JSON文字列) | - |
+| `--args-file` | - | 送信引数をJSONファイルから読み込み | - |
+| `--output` | `-o` | 出力ディレクトリ | `./output` |
+| `--output-file` | `-O` | 出力ファイルパス (上書き許可) | 自動生成 |
+| `--auto-filename` | - | `{{request_id}}_{{timestamp}}.{{ext}}` 形式で命名 | 無効 |
+| `--poll-interval` | - | ポーリング間隔 (秒) | `2.0` |
+| `--max-polls` | - | 最大ポーリング回数 | `300` |
+| `--header` | - | カスタムヘッダー追加 (`Key:Value`形式、複数可) | - |
+| `--id-param` | - | ジョブIDパラメータ名 | `request_id` |
+| `--save-logs` | - | `{{output}}/logs/` にログ保存 | 無効 |
+| `--save-logs-inline` | - | 出力ファイル横にログ保存 | 無効 |
+
+### 出力パス決定ルール
+
+1. `--output-file` 指定時: そのパスに保存 (上書き許可)
+2. `--auto-filename` 指定時: `{{request_id}}_{{timestamp}}.{{ext}}` 形式
+3. 上記以外: URLまたはContent-Dispositionからファイル名を推測
+
+### 拡張子決定ルール
+
+1. `--output-file` の拡張子
+2. レスポンスの `Content-Type` ヘッダー
+3. URLのパス
+4. 検出不可の場合は警告表示
+
+### 複数ファイル対応
+
+MCPサーバーが複数のURLを返す場合、全て自動でダウンロードされます:
+- `--output-file result.png` → `result_1.png`, `result_2.png`, ...
+- 戻り値に `saved_paths` (リスト) と `saved_path` (最初のファイル、後方互換) が含まれます
+
 {async_section}{upload_section}
-## Available Tools
-
-{chr(10).join(tool_docs)}
-
+{tool_docs_section}
 ## Usage Examples
 
 ### Direct JSON-RPC Call
@@ -538,7 +817,7 @@ result_payload = {{
     "params": {{
         "name": "{pattern['result'][0] if pattern['result'] else 'result_tool'}",
         "arguments": {{"request_id": request_id}}
-    }}
+        }}
 }}
 resp = requests.post(ENDPOINT, headers=headers, json=result_payload)
 result = resp.json()["result"]
@@ -567,91 +846,82 @@ def detect_id_param_name(tools: list[dict]) -> str:
 
 
 def generate_wrapper_script(mcp_config: dict, tools: list[dict], skill_name: str) -> str:
-    """Generate convenience wrapper script."""
+    """Generate convenience wrapper script that delegates to mcp_async_call.py."""
     endpoint = mcp_config.get("url") or mcp_config.get("endpoint", "")
     pattern = identify_async_pattern(tools)
     id_param_name = detect_id_param_name(tools)
 
-    # Get auth headers if specified
+    # Get auth headers for --header arguments
     all_headers = mcp_config.get("all_headers", {})
     auth_header = mcp_config.get("auth_header", "")
     auth_value = mcp_config.get("auth_value", "")
-    headers_code = ""
+
+    header_defaults = []
     if all_headers:
-        headers_dict = {"Content-Type": "application/json", **all_headers}
-        headers_code = f'''
-    # Authentication headers
-    headers = kwargs.get("headers") or {json.dumps(headers_dict)}
-'''
+        for k, v in all_headers.items():
+            header_defaults.append(f'    ("--header", "{k}:{v}"),')
     elif auth_header and auth_value:
-        headers_code = f'''
-    # Authentication header
-    headers = kwargs.get("headers") or {{"Content-Type": "application/json", "{auth_header}": "{auth_value}"}}
-'''
-    else:
-        headers_code = '''
-    headers = kwargs.get("headers")
-'''
+        header_defaults.append(f'    ("--header", "{auth_header}:{auth_value}"),')
+
+    header_defaults_str = "\n".join(header_defaults) if header_defaults else ""
 
     script = f'''#!/usr/bin/env python3
 """
-{skill_name} - Convenience wrapper for MCP async calls.
+{skill_name} - Wrapper with preset defaults for mcp_async_call.py
+
+This wrapper pre-configures endpoint, tool names, and authentication.
+All mcp_async_call.py options are supported and can override defaults.
+
+Usage:
+    python {skill_name.replace('-', '_')}.py --args '{{"prompt": "..."}}'
+    python {skill_name.replace('-', '_')}.py --args '{{"prompt": "..."}}' --auto-filename --save-logs
+    python {skill_name.replace('-', '_')}.py --help  # Show all available options
 """
 
 import sys
 import os
 
-# Add parent scripts to path
-sys.path.insert(0, os.path.dirname(__file__))
+# Force UTF-8 encoding for stdout/stderr (prevents UnicodeEncodeError on Windows)
+try:
+    if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
+    if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
+except Exception:
+    pass
 
-from mcp_async_call import run_async_mcp_job
+# Preset defaults (injected if not specified by user)
+DEFAULTS = [
+    ("--endpoint", "{endpoint}"),
+    ("--submit-tool", "{pattern['submit'][0] if pattern['submit'] else 'submit'}"),
+    ("--status-tool", "{pattern['status'][0] if pattern['status'] else 'status'}"),
+    ("--result-tool", "{pattern['result'][0] if pattern['result'] else 'result'}"),
+    ("--id-param", "{id_param_name}"),
+{header_defaults_str}
+]
 
-# Default configuration
-ENDPOINT = "{endpoint}"
-SUBMIT_TOOL = "{pattern['submit'][0] if pattern['submit'] else 'submit'}"
-STATUS_TOOL = "{pattern['status'][0] if pattern['status'] else 'status'}"
-RESULT_TOOL = "{pattern['result'][0] if pattern['result'] else 'result'}"
-ID_PARAM_NAME = "{id_param_name}"
+def main():
+    # Inject defaults into sys.argv (only if not already specified)
+    args = sys.argv[1:]
+    for key, value in DEFAULTS:
+        # For --header, always add (can have multiple)
+        if key == "--header":
+            if key not in args:
+                args = [key, value] + args
+        # For other options, only add if not specified
+        elif key not in args:
+            args = [key, value] + args
 
+    sys.argv = [sys.argv[0]] + args
 
-def run(arguments: dict, output_path: str = "./output", **kwargs) -> dict:
-    """
-    Run {skill_name} job with given arguments.
-
-    Args:
-        arguments: Tool input arguments
-        output_path: Where to save output files
-        **kwargs: Additional options (poll_interval, max_polls, headers, id_param_name)
-
-    Returns:
-        dict with request_id, status, download_url, saved_path
-    """
-{headers_code}
-    return run_async_mcp_job(
-        endpoint=kwargs.get("endpoint", ENDPOINT),
-        submit_tool=kwargs.get("submit_tool", SUBMIT_TOOL),
-        submit_args=arguments,
-        status_tool=kwargs.get("status_tool", STATUS_TOOL),
-        result_tool=kwargs.get("result_tool", RESULT_TOOL),
-        output_path=output_path,
-        poll_interval=kwargs.get("poll_interval", 2.0),
-        max_polls=kwargs.get("max_polls", 300),
-        headers=headers,
-        id_param_name=kwargs.get("id_param_name", ID_PARAM_NAME),
-    )
+    # Import and run mcp_async_call.py main
+    sys.path.insert(0, os.path.dirname(__file__))
+    from mcp_async_call import main as mcp_main
+    mcp_main()
 
 
 if __name__ == "__main__":
-    import argparse
-    import json
-
-    parser = argparse.ArgumentParser(description="Run {skill_name}")
-    parser.add_argument("--args", "-a", required=True, help="Arguments as JSON")
-    parser.add_argument("--output", "-o", default="./output", help="Output path")
-    args = parser.parse_args()
-
-    result = run(json.loads(args.args), args.output)
-    print(json.dumps(result, indent=2))
+    main()
 '''
     return script
 
@@ -662,6 +932,7 @@ def generate_skill(
     skill_name: str | None = None,
     tools_info_path: str | None = None,
     catalog_url: str = CATALOG_URL,
+    lazy: bool = False,
 ):
     """Generate complete skill from MCP config and catalog.
 
@@ -671,6 +942,7 @@ def generate_skill(
         skill_name: Skill name (auto-detected if not specified)
         tools_info_path: Optional path to tools.info (legacy mode)
         catalog_url: URL to mcp_tool_catalog.yaml
+        lazy: If True, generate minimal SKILL.md (tool definitions in references/tools.json)
     """
     mcp_config = load_mcp_config(mcp_config_path)
 
@@ -703,7 +975,7 @@ def generate_skill(
     os.makedirs(references_dir, exist_ok=True)
 
     # Generate SKILL.md
-    skill_md = generate_skill_md(mcp_config, tools, skill_name)
+    skill_md = generate_skill_md(mcp_config, tools, skill_name, lazy=lazy)
     (skill_dir / "SKILL.md").write_text(skill_md, encoding='utf-8')
 
     # Copy mcp_async_call.py
@@ -719,17 +991,48 @@ def generate_skill(
 
     # Save original configs as references
     (references_dir / "mcp.json").write_text(json.dumps(mcp_config, indent=2, ensure_ascii=False), encoding='utf-8')
-    (references_dir / "tools.json").write_text(json.dumps(tools, indent=2, ensure_ascii=False), encoding='utf-8')
 
-    print(f"\n✓ Skill generated: {skill_dir}")
-    print(f"  {skill_dir}/")
-    print(f"  ├── SKILL.md")
-    print(f"  ├── scripts/")
-    print(f"  │   ├── mcp_async_call.py")
-    print(f"  │   └── {skill_name.replace('-', '_')}.py")
-    print(f"  └── references/")
-    print(f"      ├── mcp.json")
-    print(f"      └── tools.json")
+    if lazy:
+        # Lazy mode: save as YAML in tools/ directory
+        tools_dir = references_dir / "tools"
+        os.makedirs(tools_dir, exist_ok=True)
+
+        # Convert to compact YAML structure
+        yaml_data = convert_tools_to_yaml_dict(tools, mcp_config, skill_name)
+        yaml_filename = f"{skill_name}.yaml"
+
+        if yaml is None:
+            print("Warning: pyyaml not installed, falling back to JSON format", file=sys.stderr)
+            (tools_dir / f"{skill_name}.json").write_text(
+                json.dumps(yaml_data, indent=2, ensure_ascii=False), encoding='utf-8'
+            )
+        else:
+            yaml_content = yaml.dump(yaml_data, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            (tools_dir / yaml_filename).write_text(yaml_content, encoding='utf-8')
+
+        print(f"\n✓ Skill generated (lazy mode): {skill_dir}")
+        print(f"  {skill_dir}/")
+        print(f"  ├── SKILL.md")
+        print(f"  ├── scripts/")
+        print(f"  │   ├── mcp_async_call.py")
+        print(f"  │   └── {skill_name.replace('-', '_')}.py")
+        print(f"  └── references/")
+        print(f"      ├── mcp.json")
+        print(f"      └── tools/")
+        print(f"          └── {yaml_filename}")
+    else:
+        # Normal mode: save as JSON
+        (references_dir / "tools.json").write_text(json.dumps(tools, indent=2, ensure_ascii=False), encoding='utf-8')
+
+        print(f"\n✓ Skill generated: {skill_dir}")
+        print(f"  {skill_dir}/")
+        print(f"  ├── SKILL.md")
+        print(f"  ├── scripts/")
+        print(f"  │   ├── mcp_async_call.py")
+        print(f"  │   └── {skill_name.replace('-', '_')}.py")
+        print(f"  └── references/")
+        print(f"      ├── mcp.json")
+        print(f"      └── tools.json")
 
     return str(skill_dir)
 
@@ -750,6 +1053,163 @@ def get_default_output_dir() -> str:
     return str(cwd_skills)
 
 
+def generate_skills_for_servers(
+    mcp_config_path: str,
+    output_dir: str,
+    server_names: list[str] | None = None,
+    catalog_url: str = CATALOG_URL,
+    lazy: bool = False,
+) -> list[str]:
+    """Generate skills for multiple servers from a single mcp.json.
+
+    Args:
+        mcp_config_path: Path to .mcp.json
+        output_dir: Output directory for generated skills
+        server_names: List of server names to process (None = all servers)
+        catalog_url: URL to mcp_tool_catalog.yaml
+        lazy: If True, generate minimal SKILL.md
+
+    Returns:
+        List of generated skill directory paths
+    """
+    all_servers = load_all_mcp_servers(mcp_config_path)
+
+    if not all_servers:
+        print("Error: No servers found in mcp.json", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine which servers to process
+    if server_names:
+        # Validate specified servers exist
+        missing = set(server_names) - set(all_servers.keys())
+        if missing:
+            print(f"Error: Server(s) not found in mcp.json: {', '.join(missing)}", file=sys.stderr)
+            print(f"Available servers: {', '.join(all_servers.keys())}", file=sys.stderr)
+            sys.exit(1)
+        servers_to_process = {name: all_servers[name] for name in server_names}
+    else:
+        servers_to_process = all_servers
+
+    print(f"Processing {len(servers_to_process)} server(s): {', '.join(servers_to_process.keys())}\n")
+
+    generated_paths = []
+    for server_name, mcp_config in servers_to_process.items():
+        print(f"--- Generating skill for: {server_name} ---")
+
+        # Fetch catalog
+        catalog = fetch_catalog(catalog_url)
+        tools = load_tools_from_catalog(catalog, server_name)
+
+        if not tools:
+            print(f"Warning: No tools found for '{server_name}', skipping", file=sys.stderr)
+            continue
+
+        # Generate skill name from server name
+        skill_name = re.sub(r"[^a-z0-9-]", "-", server_name.lower())
+
+        # Generate skill
+        path = generate_skill_internal(
+            mcp_config=mcp_config,
+            tools=tools,
+            output_dir=output_dir,
+            skill_name=skill_name,
+            lazy=lazy,
+        )
+        generated_paths.append(path)
+
+    return generated_paths
+
+
+def generate_skill_internal(
+    mcp_config: dict,
+    tools: list[dict],
+    output_dir: str,
+    skill_name: str,
+    lazy: bool = False,
+) -> str:
+    """Internal function to generate a single skill (no catalog fetch).
+
+    Args:
+        mcp_config: MCP configuration dict (already loaded)
+        tools: List of tool definitions (already loaded)
+        output_dir: Output directory for generated skill
+        skill_name: Skill name
+        lazy: If True, generate minimal SKILL.md
+
+    Returns:
+        Path to generated skill directory
+    """
+    skill_dir = Path(output_dir) / skill_name
+    scripts_dir = skill_dir / "scripts"
+    references_dir = skill_dir / "references"
+
+    # Create directories
+    os.makedirs(scripts_dir, exist_ok=True)
+    os.makedirs(references_dir, exist_ok=True)
+
+    # Generate SKILL.md
+    skill_md = generate_skill_md(mcp_config, tools, skill_name, lazy=lazy)
+    (skill_dir / "SKILL.md").write_text(skill_md, encoding='utf-8')
+
+    # Copy mcp_async_call.py
+    async_script = Path(__file__).parent / "mcp_async_call.py"
+    if async_script.exists():
+        (scripts_dir / "mcp_async_call.py").write_text(async_script.read_text(encoding='utf-8'), encoding='utf-8')
+
+    # Generate wrapper script
+    wrapper = generate_wrapper_script(mcp_config, tools, skill_name)
+    wrapper_path = scripts_dir / f"{skill_name.replace('-', '_')}.py"
+    wrapper_path.write_text(wrapper, encoding='utf-8')
+    os.chmod(wrapper_path, 0o755)
+
+    # Save original configs as references
+    (references_dir / "mcp.json").write_text(json.dumps(mcp_config, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    if lazy:
+        # Lazy mode: save as YAML in tools/ directory
+        tools_dir = references_dir / "tools"
+        os.makedirs(tools_dir, exist_ok=True)
+
+        # Convert to compact YAML structure
+        yaml_data = convert_tools_to_yaml_dict(tools, mcp_config, skill_name)
+        yaml_filename = f"{skill_name}.yaml"
+
+        if yaml is None:
+            print("Warning: pyyaml not installed, falling back to JSON format", file=sys.stderr)
+            (tools_dir / f"{skill_name}.json").write_text(
+                json.dumps(yaml_data, indent=2, ensure_ascii=False), encoding='utf-8'
+            )
+        else:
+            yaml_content = yaml.dump(yaml_data, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            (tools_dir / yaml_filename).write_text(yaml_content, encoding='utf-8')
+
+        print(f"\n✓ Skill generated (lazy mode): {skill_dir}")
+        print(f"  {skill_dir}/")
+        print(f"  ├── SKILL.md")
+        print(f"  ├── scripts/")
+        print(f"  │   ├── mcp_async_call.py")
+        print(f"  │   └── {skill_name.replace('-', '_')}.py")
+        print(f"  └── references/")
+        print(f"      ├── mcp.json")
+        print(f"      └── tools/")
+        print(f"          └── {yaml_filename}")
+    else:
+        # Normal mode: save as JSON
+        (references_dir / "tools.json").write_text(json.dumps(tools, indent=2, ensure_ascii=False), encoding='utf-8')
+
+        print(f"\n✓ Skill generated: {skill_dir}")
+        print(f"  {skill_dir}/")
+        print(f"  ├── SKILL.md")
+        print(f"  ├── scripts/")
+        print(f"  │   ├── mcp_async_call.py")
+        print(f"  │   └── {skill_name.replace('-', '_')}.py")
+        print(f"  └── references/")
+        print(f"      ├── mcp.json")
+        print(f"      └── tools.json")
+
+    return str(skill_dir)
+
+
 def main():
     default_output = get_default_output_dir()
     parser = argparse.ArgumentParser(
@@ -757,11 +1217,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate skill using catalog (recommended)
-  # Output: .claude/skills/<skill-name>/SKILL.md
+  # Generate skills for ALL servers in mcp.json
   python generate_skill.py -m mcp.json
 
-  # Generate skill with legacy tools.info
+  # Generate skill for specific server(s) only
+  python generate_skill.py -m mcp.json -s fal-ai/flux-lora
+  python generate_skill.py -m mcp.json -s server1 -s server2
+
+  # Generate minimal SKILL.md (lazy loading mode)
+  python generate_skill.py -m mcp.json --lazy
+
+  # Generate skill with legacy tools.info (single server only)
   python generate_skill.py -m mcp.json -t tools.info
 
   # Use custom catalog URL
@@ -772,21 +1238,41 @@ Examples:
 """
     )
     parser.add_argument("--mcp-config", "-m", required=True, help="Path to .mcp.json")
-    parser.add_argument("--tools-info", "-t", help="Path to tools.info (legacy mode, optional)")
+    parser.add_argument("--servers", "-s", action="append", dest="servers",
+                        help="Server name(s) to generate (can specify multiple, default: all)")
+    parser.add_argument("--tools-info", "-t", help="Path to tools.info (legacy mode, single server only)")
     parser.add_argument("--output", "-o", default=default_output,
                         help=f"Output directory (default: {default_output})")
-    parser.add_argument("--name", "-n", help="Skill name (auto-detected if not specified)")
+    parser.add_argument("--name", "-n", help="Skill name (auto-detected if not specified, only for single server)")
     parser.add_argument("--catalog-url", default=CATALOG_URL,
                         help=f"URL to mcp_tool_catalog.yaml (default: {CATALOG_URL})")
+    parser.add_argument("--lazy", "-l", action="store_true",
+                        help="Generate minimal SKILL.md (tool definitions in references/tools/*.yaml)")
 
     args = parser.parse_args()
-    generate_skill(
-        mcp_config_path=args.mcp_config,
-        output_dir=args.output,
-        skill_name=args.name,
-        tools_info_path=args.tools_info,
-        catalog_url=args.catalog_url,
-    )
+
+    # Legacy mode: tools.info specified (single server only)
+    if args.tools_info:
+        if args.servers and len(args.servers) > 1:
+            print("Error: --tools-info only supports single server mode", file=sys.stderr)
+            sys.exit(1)
+        generate_skill(
+            mcp_config_path=args.mcp_config,
+            output_dir=args.output,
+            skill_name=args.name,
+            tools_info_path=args.tools_info,
+            catalog_url=args.catalog_url,
+            lazy=args.lazy,
+        )
+    else:
+        # Multi-server mode
+        generate_skills_for_servers(
+            mcp_config_path=args.mcp_config,
+            output_dir=args.output,
+            server_names=args.servers,
+            catalog_url=args.catalog_url,
+            lazy=args.lazy,
+        )
 
 
 if __name__ == "__main__":

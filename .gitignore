@@ -10,3 +10,4 @@ output/
 # MCP and tools files
 mcp*.json
 tools*
+__pycache__/
