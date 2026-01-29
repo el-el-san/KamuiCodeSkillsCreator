@@ -127,5 +127,5 @@ python .claude/skills/mcp-async-skill/scripts/mcp_queue_client.py --shutdown
 ## バージョン履歴
 
 - **v2.1.0（現状）**: 並列処理の制限を加えたもの（キューデーモンで同時実行数・起動間隔・レート制限を管理）
-- **v2.0.0**: フォーク版（https://github.com/Yumeno/LazyKamuiCodeSkillsCreator.git）を取り込んだもの
+- **v2.0.0**: フォーク版（ https://github.com/Yumeno/LazyKamuiCodeSkillsCreator.git ）を取り込んだもの
 - **v1.0.0**: 初期版
